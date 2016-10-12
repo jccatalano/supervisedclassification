@@ -1,0 +1,222 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(tokenizers)
+library(text2vec)
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(forcats)
+library(ggplot2)
+library(glmnet)
+library(doParallel)
+library(Matrix)
+library(broom)
+library(tidyr)
+library(tibble)
+library(devtools)
+library(wordVectors)
+library(ggrepel)
+library(apcluster)
+library(caret)
+library(tidyverse)
+set.seed(851)
+```
+```{r}
+
+# Code to clean meta data
+
+us_items <- read_csv("C:/Users/Joshua/Documents/rdata/data/us-items.csv",
+                     col_types = cols(
+  .default = col_character(),
+  document_id = col_character(),
+  publication_date = col_date(format = ""),
+  release_date = col_date(format = ""),
+  volume_current = col_integer(),
+  volume_total = col_integer(),
+  page_count = col_integer()
+))
+
+us_authors <- read_csv("C:/Users/Joshua/Documents/rdata/data/us-authors.csv", 
+                       col_types = cols(
+  document_id = col_character(),
+  author = col_character(),
+  birth_year = col_character(),
+  death_year = col_integer(),
+  marc_dates = col_character(),
+  byline = col_character()
+))
+
+us_subjects <- read_csv("C:/Users/Joshua/Documents/rdata/data/us-subjects.csv", col_types = cols(
+  document_id = col_character(),
+  subject_source = col_character(),
+  subject_type = col_character(),
+  subject = col_character()
+))
+
+us_authors <- read_csv("C:/Users/Joshua/Documents/rdata/data/us-authors.csv",
+                       col_types = cols(.default = col_character()))
+
+get_year <- function(x) { as.integer(str_extract(x, "\\d{4}")) }
+
+
+pick <- function(x, y) { ifelse(!is.na(x), x, y) }
+
+us_authors <- us_authors %>%
+  mutate(birth_year = get_year(birth_year),
+         death_year = get_year(death_year),
+         creator = pick(author, byline))
+
+us_subjects_moml <- us_subjects %>%
+  filter(subject_source == "MOML",
+         subject != "US") %>%
+  distinct(document_id, subject)
+
+us_subjects_loc <- us_subjects %>%
+  filter(subject_source == "LOC")
+
+rm(us_subjects)
+
+us_items <- read_csv("C:/Users/Joshua/Documents/rdata/data/us-items.csv",
+                     col_types = cols(
+                         .default = col_character(),
+                         publication_date = col_date(format = ""),
+                         release_date = col_date(format = ""),
+                         volume_current = col_integer(),
+                         volume_total = col_integer(),
+                         page_count = col_integer()
+                       ))
+
+clean_place <- function(x) {
+  str_split(x, ",", n = 2) %>%
+    map_chr(1) %>%
+    str_replace_all("[[:punct:]]", "")
+}
+
+us_items <- us_items %>%
+  mutate(city = clean_place(imprint_city),
+         city = fct_recode(city,
+                           "Unknown" = "Sl",
+                           "Unknown" = "US",
+                           "New York" = "NewYork",
+                           "Boston" = "Boston New York",
+                           "Cambridge" = "Cambridge Mass",
+                           "New York" = "New York City",
+                           "Washington" = "Washington DC"),
+         publication_year = lubridate::year(publication_date)) %>%
+  filter(publication_year > 1795,
+         publication_year < 1925)
+
+```
+The aim of this notebook is to create a supervised classifier that can tell the difference between different kinds of legal treatises.
+
+First load in some data and create a DTM using n-grams. This example will use the railroad and medical treatises organized by document.
+
+
+```{r}
+railroad <- list.files("C:/Users/Joshua/Documents/rdata/railroaddata/railroads_documents",
+                       full.names = TRUE)
+
+medical  <- list.files("C:/Users/Joshua/Documents/rdata/meddata/medical-documents/medical-documents",
+                       full.names = TRUE)
+all_files <- c(railroad, medical)
+keepers <- 75
+subset_files <- c(sample(railroad, keepers), sample(medical, keepers))
+
+reader <- function(f) {
+  n <- basename(f) %>% stringr::str_replace("\\.txt", "")
+  doc <- readr::read_file(f)
+  names(doc) <- n
+  doc
+}
+
+tokenizer <- function(x) {
+  tokenizers::tokenize_ngrams(x, n = 3, stopwords = tokenizers::stopwords("en"))
+}
+
+
+cached_dtm <- "cache/supervised-classification-dtm.rds"
+if (!file.exists(cached_dtm)) {
+  jobs <- subset_files %>% 
+    map(ifiles, reader = reader) %>% 
+    map(itoken, chunks_number = 1, tokenizer = tokenizer, progressbar = FALSE)
+  vocab <- create_vocabulary(jobs)
+  pruned <- prune_vocabulary(vocab, term_count_min = 20,
+                             doc_proportion_min = 0.1,
+                             doc_proportion_max = 0.9)
+  message("Keeping ", round(nrow(pruned$vocab) / nrow(vocab$vocab), 4) * 100,
+          "% of the vocabulary.")
+  vectorizer <- vocab_vectorizer(pruned)
+  dtm <- create_dtm(jobs, vectorizer)
+  dir.create(dirname(cached_dtm), showWarnings = FALSE)
+  saveRDS(dtm, cached_dtm)
+} else {
+  dtm <- readRDS(cached_dtm)
+}
+```
+Create a data frame that knows where each document is from (ie which subcorpus). 
+
+```{r}
+documents <- data_frame(document_id = rownames(dtm)) %>% 
+  left_join(us_subjects_moml, by = "document_id") %>% 
+  group_by(document_id) %>% 
+  mutate(subject = if_else(str_detect(subject, "Medical"), "medical", "railroad")) %>% 
+  distinct(document_id, subject, .keep_all = TRUE) %>% 
+  ungroup() 
+documents %>% count(subject) %>% View
+
+stopifnot(all(documents$document_id == rownames(dtm))) # just to make sure
+```
+
+Creating a training set and a test set of the data.
+
+```{r}
+split_i <- createDataPartition(y = documents$subject, p = 0.7)
+training <- as.matrix(dtm[split_i$Resample1, ])
+training_labels <- as.factor(documents$subject[split_i$Resample1])
+testing <- as.matrix(dtm[-split_i$Resample1, ])
+testing_labels <- as.factor(documents$subject[-split_i$Resample1])
+```
+
+Now the model is trained.When the bottom `model` is ran, it will produce a k-nearest neighbor output. This simple model predicts the number of clusters that will yield the most accurate results. In this case the recommended number is 11. This is calculated based on sensitivity and specificity. 
+
+Sensitivity (y axis 0-1) is the probability of a positive test for a specific instance (identifying a person with a disease).For example, a sensitivity of 100% means that a model used to predict college achievment will correctly identify all students who will perform well; however, this will also identify all the students who will not perform well. 
+
+Specificity (x axis 1-0) is the probability of a negative test among patients without a disease. A high specificity means that there are very few false tests. Continuing the example above, a high speceficity means that very few poor performing students would be incorrectly identified as positive performing. 
+
+The key is to find a balence that yeilds positive identifications without a significant amount of misidentifications. 
+
+So in the example below, 11 has a sensitivity of 0.516 meaning that it will correctly identify a text as either a railroad or medical document over half of the time. While rarely mis identifying the text since the specificity is 0.97 (very close to 1).
+
+The receiver operating characteristic (ROC)
+
+```{r}
+
+tr_ctrl <- trainControl(method = "repeatedcv",
+             number = 5, 
+             repeats = 5,
+             savePredictions = "final",
+             classProbs = TRUE,
+             summaryFunction = twoClassSummary)
+
+model <- train(training, training_labels, 
+               method = "knn",
+               tuneLength = 10,
+               preProcess = c("center", "scale"),
+               trControl = tr_ctrl)
+model
+```
+Now that we have a model, we can predict the results of our training data. We can create a confusion matrix to compare the results that our model gets with the results that we know are true.
+
+```{r}
+
+training_predictions <- predict(model, training)
+confusionMatrix(training_predictions, training_labels)
+```
+
+
